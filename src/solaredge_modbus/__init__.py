@@ -1,12 +1,13 @@
+# Updated version of the 0.8.0 package available at github:
+# https://github.com/nmakel/solaredge_modbus/blob/master/src/solaredge_modbus/__init__.py
+# commit code 1bdf3f3 from January 2025
+# Updated by nessnaj to work with pymodbus version 3.12.
+
 import enum
 import time
 
-from pymodbus.constants import Endian
-from pymodbus.payload import BinaryPayloadBuilder
-from pymodbus.payload import BinaryPayloadDecoder
 from pymodbus.client import ModbusTcpClient
 from pymodbus.client import ModbusSerialClient
-from pymodbus.register_read_message import ReadHoldingRegistersResponse
 
 
 RETRIES = 3
@@ -192,7 +193,7 @@ class SolarEdge:
     stopbits = 1
     parity = "N"
     baud = 115200
-    wordorder = Endian.BIG
+    wordorder = "big"
 
     def __init__(
         self, host=False, port=False,
@@ -266,161 +267,211 @@ class SolarEdge:
         else:
             return f"<{self.__class__.__module__}.{self.__class__.__name__} object at {hex(id(self))}>"
 
-    def _read_holding_registers(self, address, length):
-        # Check if the register needs little endian
-        wordorder = Endian.LITTLE if address in self.little_endian_registers else self.wordorder
+    # Method did not exist while being referenced in _read and _read_all. So for completeness, defined here.
+    # In practice no problems as all registers for SolarEdge are Holding registers.
+    def _read_input_registers(self, slave, address, length):
+        raise NotImplementedError("INPUT registers are not used/implemented for SolarEdge")
 
+    def _read_holding_registers(self, slave, address, length):
         for i in range(self.retries):
-            if not self.connected():
-                self.connect()
-                time.sleep(0.1)
-                continue
+            try:
+                if not self.connected():
+                    self.connect()
+                    time.sleep(0.1)
+                    continue
 
-            result = self.client.read_holding_registers(address, length, slave=self.unit)
-            if not isinstance(result, ReadHoldingRegistersResponse):
-                continue
-            if len(result.registers) != length:
-                continue
+                result = self.client.read_holding_registers(address, count=length, device_id=slave)
 
-            return BinaryPayloadDecoder.fromRegisters(result.registers, byteorder=Endian.BIG, wordorder=wordorder)
+                if result is None or result.isError():
+                    continue
+                if not hasattr(result, "registers") or len(result.registers) != length:
+                    continue
+
+                return result.registers
+
+            except(BrokenPipeError, ConnectionResetError, TimeoutError, OSError) as e:
+                # Socket got closed by peer/NAT; force reconnect next iteration
+                try:
+                    self.client.close()
+                except Exception:
+                    pass
+                time.sleep(self.timeout)
+                continue
 
         return None
 
-    def _write_holding_register(self, address, value, dtype):
-        # Determine byte order based on address
-        wordorder = Endian.LITTLE if address in self.little_endian_registers else self.wordorder
+    def _write_holding_register(self, slave, address, values):
+        for _ in range(self.retries):
+            try:
+                if not self.connected():
+                    self.connect()
+                    time.sleep(0.1)
 
-        # Use dtype and wordorder to encode the value properly
-        encoded_value = self._encode_value(value, dtype, wordorder)
-        return self.client.write_registers(address=address, values=encoded_value, slave=self.unit)
+                return self.client.write_registers(address=address, values=values, device_id=slave)
 
-    def _encode_value(self, data, dtype, wordorder):
-        builder = BinaryPayloadBuilder(byteorder=Endian.BIG, wordorder=wordorder)
+            except(BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+                try:
+                    self.client.close()
+                except Exception:
+                    pass
+                time.sleep(self.timeout)
+                continue
 
-        try:
-            if dtype == registerDataType.INT16:
-                builder.add_16bit_int(data)
-            elif dtype == registerDataType.UINT16:
-                builder.add_16bit_uint(data)
-            elif (dtype == registerDataType.FLOAT32 or
-                  dtype == registerDataType.SEFLOAT):
-                builder.add_32bit_float(data)
-            elif dtype == registerDataType.INT32:
-                builder.add_32bit_int(data)
-            elif dtype == registerDataType.UINT32:
-                builder.add_32bit_uint(data)
-            elif dtype == registerDataType.UINT64:
-                builder.add_64bit_uint(data)
-            elif dtype == registerDataType.STRING:
-                builder.add_string(data)
+        return None
+
+    def _dtype_to_client_datatype(self, dtype):
+        DT = ModbusTcpClient.DATATYPE
+        return {
+            registerDataType.UINT16: DT.UINT16,
+            registerDataType.UINT32: DT.UINT32,
+            registerDataType.UINT64: DT.UINT64,
+            registerDataType.INT16: DT.INT16,
+            registerDataType.ACC32: DT.UINT32,
+            registerDataType.FLOAT32: DT.FLOAT32,
+            registerDataType.SEFLOAT: DT.FLOAT32,
+            registerDataType.INT32: DT.INT32,
+            registerDataType.STRING: DT.STRING,
+        }[dtype]
+
+    def _encode_value(self, data, dtype):
+        dt = self._dtype_to_client_datatype(dtype)
+        return self.client.convert_to_registers(
+            data,
+            data_type=dt,
+            word_order=self.wordorder,
+            string_encoding="utf-8",
+        )
+
+    def _decode_value(self, registers, dtype, vtype):
+        if registers is None:
+            raise AttributeError("No registers")
+
+        # --- robust SunSpec string handling ---
+        if dtype == registerDataType.STRING:
+            # Each 16-bit register contains 2 bytes, high then low
+            b = bytearray()
+            for r in registers:
+                b.append((r >> 8) & 0xFF)
+                b.append(r & 0xFF)
+
+            # Common padding values
+            b = b.replace(b"\x00", b"")  # null padding
+            b = b.replace(b"\xFF", b"")  # 0xFFFF padding -> 0xFF bytes
+
+            s = b.decode("utf-8", errors="ignore").strip()
+            return vtype(s)
+
+        dt = self._dtype_to_client_datatype(dtype)
+        decoded = self.client.convert_from_registers(
+            registers,
+            data_type=dt,
+            word_order=self.wordorder,
+            string_encoding="utf-8",
+        )
+
+        if dtype == registerDataType.STRING and isinstance(decoded, str):
+            decoded = decoded.replace("\x00", "").rstrip()
+
+        # If pymodbus returns a list, collapse singletons, otherwise keep list
+        if isinstance(decoded, list):
+            if len(decoded) == 1:
+                decoded = decoded[0]
             else:
-                raise NotImplementedError(dtype)
-        except NotImplementedError:
-            raise
-        return builder.to_registers()
+                # Multi-value decode; don't force-cast to int/float/str
+                return decoded
 
-    def _decode_value(self, data, length, dtype, vtype):
-        try:
-            if dtype == registerDataType.INT16:
-                decoded = data.decode_16bit_int()
-            elif dtype == registerDataType.INT32:
-                decoded = data.decode_32bit_int()
-            elif dtype == registerDataType.UINT16:
-                decoded = data.decode_16bit_uint()
-            elif (dtype == registerDataType.UINT32 or
-                  dtype == registerDataType.ACC32):
-                decoded = data.decode_32bit_uint()
-            elif dtype == registerDataType.UINT64:
-                decoded = data.decode_64bit_uint()
-            elif (dtype == registerDataType.FLOAT32 or
-                  dtype == registerDataType.SEFLOAT):
-                decoded = data.decode_32bit_float()
-            elif dtype == registerDataType.STRING:
-                decoded = data.decode_string(length * 2).decode(encoding="utf-8", errors="ignore").replace("\x00", "").rstrip()
-            else:
-                raise NotImplementedError(dtype)
-            if decoded == SUNSPEC_NOTIMPLEMENTED[dtype.name]:
-                return vtype(False)
-            elif decoded != decoded:
-                return vtype(False)
-            else:
-                return vtype(decoded)
-        except NotImplementedError:
-            raise
+        return vtype(decoded)
 
     def _read(self, value):
         address, length, rtype, dtype, vtype, label, fmt, batch = value
-        try:
-            if rtype == registerType.INPUT:
-                return self._decode_value(self._read_input_registers(address, length), length, dtype, vtype)
-            elif rtype == registerType.HOLDING:
-                return self._decode_value(self._read_holding_registers(address, length), length, dtype, vtype)
-            else:
-                raise NotImplementedError(rtype)
-        except NotImplementedError:
-            raise
-        except AttributeError:
+
+        if rtype == registerType.INPUT:
+            regs = self._read_input_registers(self.unit, address, length)  # -> list[int] | None
+        elif rtype == registerType.HOLDING:
+            regs = self._read_holding_registers(self.unit, address, length)  # -> list[int] | None
+        else:
+            raise NotImplementedError(rtype)
+
+        if not regs:
             return False
 
+        # regs is a list[int]; _decode_value will use convert_from_registers
+        return self._decode_value(regs, dtype, vtype)
+
     def _read_all(self, values, rtype):
-        addr_min = False
-        addr_max = False
+        """
+        New-pymodbus friendly version:
+        - does ONE contiguous Modbus read for the whole batch
+        - works with _read_*_registers returning a list[int] (raw registers)
+        - decodes each field by slicing the raw register list (no skip_bytes / BinaryPayloadDecoder)
+        """
+        # Determine contiguous range [addr_min, addr_max)
+        addr_min = None
+        addr_max = None
+        #v_slave = None
 
-        for k, v in values.items():
+        for _k, v in values.items():
+            #v_slave = v[0]
             v_addr = v[0]
-            v_length = v[1]
+            v_len = v[1]
 
-            if addr_min is False:
+            if addr_min is None or v_addr < addr_min:
                 addr_min = v_addr
-            if addr_max is False:
-                addr_max = v_addr + v_length
+            end = v_addr + v_len
+            if addr_max is None or end > addr_max:
+                addr_max = end
 
-            if v_addr < addr_min:
-                addr_min = v_addr
-            if (v_addr + v_length) > addr_max:
-                addr_max = v_addr + v_length
+        if addr_min is None or addr_max is None:
+            return {}
 
+        base_addr = addr_min
+        total_count = addr_max - addr_min  # number of registers to read
+
+        # Read one contiguous block (raw list[int])
+        if rtype == registerType.INPUT:
+            raw = self._read_input_registers(self.unit, base_addr, total_count)  # must return list[int] | None
+        elif rtype == registerType.HOLDING:
+            raw = self._read_holding_registers(self.unit, base_addr, total_count)  # must return list[int] | None
+        else:
+            raise NotImplementedError(rtype)
+
+        if not raw:
+            return {}
+
+        # Decode each entry by slicing its register window out of the raw list
         results = {}
-        offset = addr_min
-        length = addr_max - addr_min
+        for k, v in sorted(values.items(), key=lambda kv: kv[1][0]):  # sort by address
+            address, count, _rtype, dtype, vtype, label, fmt, batch = v
 
-        try:
-            if rtype == registerType.INPUT:
-                data = self._read_input_registers(offset, length)
-            elif rtype == registerType.HOLDING:
-                data = self._read_holding_registers(offset, length)
-            else:
-                raise NotImplementedError(rtype)
+            start = address - base_addr
+            end = start + count
+            if start < 0 or end > len(raw):
+                continue
+            regs = raw[start:end]
 
-            if not data:
-                return results
+            if len(regs) != count:
+                # defensive: contiguous read didn't include expected slice
+                continue
 
-            for k, v in values.items():
-                address, length, rtype, dtype, vtype, label, fmt, batch = v
-
-                if address > offset:
-                    skip_bytes = address - offset
-                    offset += skip_bytes
-                    data.skip_bytes(skip_bytes * 2)
-
-                results[k] = self._decode_value(data, length, dtype, vtype)
-                offset += length
-        except NotImplementedError:
-            raise
+            results[k] = self._decode_value(regs, dtype, vtype)
 
         return results
 
     def _write(self, value, data):
         # Unpack value tuple to extract necessary information
         address, length, rtype, dtype, vtype, label, fmt, batch = value
-        try:
-            if rtype == registerType.HOLDING:
-                # Pass dtype to _write_holding_register
-                return self._write_holding_register(address, data, dtype)
-            else:
-                raise NotImplementedError(rtype)
-        except NotImplementedError:
-            raise
+
+        if rtype != registerType.HOLDING:
+            raise NotImplementedError(rtype)
+
+        regs = self._encode_value(data, dtype)  # -> list[int]
+        resp = self._write_holding_register(self.unit, address, regs)  # uses device_id=slave internally
+
+        # Optional but recommended: pymodbus can return an error response without raising
+        if resp is None or (hasattr(resp, "isError") and resp.isError()):
+            return False
+
+        return True
 
     def connect(self):
         return self.client.connect()
@@ -462,7 +513,7 @@ class Inverter(SolarEdge):
 
     def __init__(self, *args, **kwargs):
         self.model = "Inverter"
-        self.wordorder = Endian.BIG
+        self.wordorder = "big"
 
         super().__init__(*args, **kwargs)
 
@@ -547,10 +598,13 @@ class Inverter(SolarEdge):
             "commit_power_control_settings": (0xf100, 1, registerType.HOLDING, registerDataType.INT16, int, "Commit Power Control Settings", "", 4),
             "restore_power_control_default_settings": (0xf101, 1, registerType.HOLDING, registerDataType.INT16, int, "Restore Power Control Default Settings", "", 4),
 
+            # Documentation 'application_note_power_control_configuration-v1.3.pdf' page 7 indicates 0xf104
             "reactive_power_config": (0xf103, 2, registerType.HOLDING, registerDataType.INT32, int, "Reactive Power Config", REACTIVE_POWER_CONFIG_MAP, 4),
+            # Documentation 'application_note_power_control_configuration-v1.3.pdf' page 7 indicates 0xf106
             "reactive_power_response_time": (0xf105, 2, registerType.HOLDING, registerDataType.UINT32, int, "Reactive Power Response Time", "ms", 4),
 
-            "advanced_power_control_enable": (0xf142, 2, registerType.HOLDING, registerDataType.UINT16, int, "Advanced Power Control Enable", "", 4),
+            # Documentation 'application_note_power_control_configuration-v1.3.pdf' page 4 indicates Int32 instead of UINT16
+            "advanced_power_control_enable": (0xf142, 2, registerType.HOLDING, registerDataType.INT32, int, "Advanced Power Control Enable", "", 4),
 
             "export_control_mode": (0xf700, 1, registerType.HOLDING, registerDataType.UINT16, int, "Export Control Mode", "", 5),
             "export_control_limit_mode": (0xf701, 1, registerType.HOLDING, registerDataType.UINT16, int, "Export Control Limit Mode", EXPORT_CONTROL_LIMIT_MAP, 5),
@@ -594,7 +648,7 @@ class Meter(SolarEdge):
 
     def __init__(self, offset=False, *args, **kwargs):
         self.model = f"Meter{offset + 1}"
-        self.wordorder = Endian.BIG
+        self.wordorder = "big"
 
         super().__init__(*args, **kwargs)
 
@@ -692,7 +746,7 @@ class Meter(SolarEdge):
         }
 
 class StorEdge(SolarEdge):
-    
+
     def __init__(self, *args, **kwargs):
         self.model = "StorEdge"
         self.wordorder = Endian.LITTLE
@@ -703,7 +757,7 @@ class StorEdge(SolarEdge):
             "export_control_mode": (0xe000, 1, registerType.HOLDING, registerDataType.UINT16, int, "Export Control Mode", EXPORT_CONTROL_MODE_MAP, 1),
             "export_control_limit_mode": (0xe001, 1, registerType.HOLDING, registerDataType.UINT16, int, "Export Control Limit Mode", EXPORT_CONTROL_LIMIT_MAP, 1),
             "export_control_site_limit": (0xe002, 2, registerType.HOLDING, registerDataType.SEFLOAT, float, "Export Control Site Limit", "", 1),
-            
+
             "storedge_control_mode": (0xe004, 1, registerType.HOLDING, registerDataType.UINT16, int, "StorEdge Control Mode", STOREDGE_CONTROL_MODE, 1),
             "storedge_ac_charge_policy": (0xe005, 1, registerType.HOLDING, registerDataType.UINT16, int, "StorEdge AC Charge Policy", STOREDGE_AC_CHARGE_POLICY, 1),
             "storedge_ac_charge_limit": (0xe006, 2, registerType.HOLDING, registerDataType.SEFLOAT, float, "StorEdge AC Charge Limit (kWh or %)", "", 1),
@@ -720,7 +774,7 @@ class Battery(SolarEdge):
 
     def __init__(self, offset=False, *args, **kwargs):
         self.model = f"Battery{offset + 1}"
-        self.wordorder = Endian.LITTLE
+        self.wordorder = "little"
 
         super().__init__(*args, **kwargs)
 
