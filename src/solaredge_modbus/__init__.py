@@ -408,10 +408,8 @@ class SolarEdge:
         # Determine contiguous range [addr_min, addr_max)
         addr_min = None
         addr_max = None
-        #v_slave = None
-
+    
         for _k, v in values.items():
-            #v_slave = v[0]
             v_addr = v[0]
             v_len = v[1]
 
